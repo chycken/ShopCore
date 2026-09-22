@@ -1,3 +1,8 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Threading;
 using Microsoft.Extensions.Logging;
 using ShopCore.Contract;
 using SwiftlyS2.Shared;
@@ -9,53 +14,142 @@ using SwiftlyS2.Shared.Natives;
 using SwiftlyS2.Shared.Players;
 using SwiftlyS2.Shared.Plugins;
 using SwiftlyS2.Shared.SchemaDefinitions;
-using System.Diagnostics.CodeAnalysis;
+
+using Color = SwiftlyS2.Shared.Natives.Color;
+using SystemColor = System.Drawing.Color;
+using ColorTranslator = System.Drawing.ColorTranslator;
 
 namespace ShopCore;
 
+#region Helper Models and Enums
+
+public enum TracerColorMode
+{
+    Static,
+    Random,
+    Team
+}
+
+public sealed class TracersModuleConfig
+{
+    public TracersModuleSettings Settings { get; set; } = new();
+    public List<TracerItemTemplate> Items { get; set; } = new();
+}
+
+public sealed class TracersModuleSettings
+{
+    public string Category { get; set; } = "Visuals/Tracers";
+    public bool UseCorePrefix { get; set; } = true;
+    public float MinDrawIntervalSeconds { get; set; } = 0.05f;
+    public int PoolSizePerPlayer { get; set; } = 8;
+    public float DefaultLifeSeconds { get; set; } = 0.4f;
+    public float DefaultStartWidth { get; set; } = 2.0f;
+    public float DefaultEndWidth { get; set; } = 1.0f;
+    public float DefaultOriginZOffset { get; set; } = 57f;
+}
+
+public sealed class TracerItemTemplate
+{
+    public string Id { get; set; } = string.Empty;
+    public string DisplayName { get; set; } = string.Empty;
+    public string DisplayNameKey { get; set; } = string.Empty;
+    public string ColorDisplayName { get; set; } = string.Empty;
+    public string Color { get; set; } = string.Empty;
+    public decimal Price { get; set; }
+    public decimal? SellPrice { get; set; }
+    public int DurationSeconds { get; set; }
+    public string Type { get; set; } = nameof(ShopItemType.Temporary);
+    public string Team { get; set; } = nameof(ShopItemTeam.Any);
+    public bool Enabled { get; set; } = true;
+    public bool CanBeSold { get; set; } = true;
+    public float? LifeSeconds { get; set; }
+    public float? StartWidth { get; set; }
+    public float? EndWidth { get; set; }
+    public float? OriginZOffset { get; set; }
+    public string? RequiredPermission { get; set; }
+}
+
+public readonly record struct TracerItemRuntime(
+    string ItemId,
+    TracerColorMode ColorMode,
+    Color StaticColor,
+    float LifeSeconds,
+    float StartWidth,
+    float EndWidth,
+    float OriginZOffset,
+    string RequiredPermission
+);
+
+public readonly record struct TracerPreviewState(
+    TracerItemRuntime Runtime,
+    float ExpiresAt
+);
+
+public readonly record struct CachedTracerRuntime(
+    TracerItemRuntime Runtime,
+    bool HasRuntime,
+    float NextRefreshAt
+);
+
+public sealed class TracerBeamPool
+{
+    public CBeam?[] Slots { get; }
+    public float[] HideAt { get; }
+    public bool[] Hidden { get; }
+    public int NextIndex { get; set; }
+
+    public TracerBeamPool(int size)
+    {
+        Slots = new CBeam?[size];
+        HideAt = new float[size];
+        Hidden = new bool[size];
+    }
+}
+
+#endregion
+
 [PluginMetadata(
-    Id = "Shop_PlayerColor",
-    Name = "Shop PlayerColor",
+    Id = "Shop_Tracers",
+    Name = "Shop Tracers",
     Author = "T3Marius",
-    Version = "1.0.0",
-    Description = "ShopCore module with player color items"
+    Version = "1.0.1",
+    Description = "ShopCore module with bullet tracer items"
 )]
-public class Shop_PlayerColor : BasePlugin
+public class Shop_Tracers : BasePlugin
 {
     private const string ShopCoreInterfaceKey = "ShopCore.API.v2";
-    private const string ModulePluginId = "Shop_PlayerColor";
-    private const string TemplateFileName = "playercolor_config.jsonc";
+    private const string ModulePluginId = "Shop_Tracers";
+    private const string TemplateFileName = "tracers_config.jsonc";
     private const string TemplateSectionName = "Main";
-    private const string DefaultCategory = "Visuals/Player Colors";
-    private const float PreviewDurationSeconds = 8f;
+    private const string DefaultCategory = "Visuals/Tracers";
+    private const float PreviewDurationSeconds = 12f;
+    private const float BeamSweepIntervalSeconds = 0.05f;
+    private const float ActiveRuntimeRefreshSeconds = 2.0f;
 
-    private static readonly Color DefaultPlayerColor = new(255, 255, 255, 255);
-
-    private readonly HashSet<string> registeredItemIds = new(StringComparer.OrdinalIgnoreCase);
-    private readonly List<string> registeredItemOrder = new();
-    private readonly List<int> rainbowPlayersToRemove = new();
-    private readonly Dictionary<string, PlayerColorItemRuntime> itemRuntimeById = new(StringComparer.OrdinalIgnoreCase);
-    private readonly Dictionary<int, float> nextRainbowUpdateAtByPlayerId = new();
-    private readonly Dictionary<int, PlayerColorPreviewState> previewRuntimeByPlayerId = new();
-    private readonly Dictionary<int, PlayerColorItemRuntime?> cachedRuntimeByPlayerId = new();
-    private readonly Random random = new();
+    private static readonly Color TeamTColor = new((byte)255, (byte)220, (byte)50, (byte)255);
+    private static readonly Color TeamCtColor = new((byte)80, (byte)170, (byte)255, (byte)255);
 
     private IShopCoreApiV2? shopApi;
     private bool handlersRegistered;
-    private PlayerColorModuleSettings runtimeSettings = new();
 
-    public Shop_PlayerColor(ISwiftlyCore core) : base(core)
-    {
-    }
+    private readonly HashSet<string> registeredItemIds = new(StringComparer.OrdinalIgnoreCase);
+    private readonly List<string> registeredItemOrder = new();
+    private readonly Dictionary<string, TracerItemRuntime> itemRuntimeById = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<int, TracerPreviewState> previewRuntimeByPlayerId = new();
+    private readonly Dictionary<int, CachedTracerRuntime> activeRuntimeByPlayerId = new();
+    private readonly Dictionary<int, float> nextDrawAllowedAtByPlayerId = new();
+    private readonly Dictionary<int, TracerBeamPool> beamPoolByPlayerId = new();
+    private CancellationTokenSource? beamSweepTimer;
+    private readonly Random random = new();
+
+    private TracersModuleSettings runtimeSettings = new();
+
+    public Shop_Tracers(ISwiftlyCore core) : base(core) { }
 
     public override void UseSharedInterface(IInterfaceManager interfaceManager)
     {
         shopApi = null;
-
-        if (!interfaceManager.HasSharedInterface(ShopCoreInterfaceKey))
-        {
-            return;
-        }
+        if (!interfaceManager.HasSharedInterface(ShopCoreInterfaceKey)) return;
 
         try
         {
@@ -69,191 +163,110 @@ public class Shop_PlayerColor : BasePlugin
 
     public override void OnSharedInterfaceInjected(IInterfaceManager interfaceManager)
     {
-        if (shopApi == null)
-        {
-            Core.Logger.LogWarning("ShopCore API is not available. PlayerColor items will not be registered.");
-            return;
-        }
-
+        if (shopApi == null) return;
         RegisterItemsAndHandlers();
     }
 
     public override void Load(bool hotReload)
     {
-        Core.Event.OnTick += OnTick;
         Core.Event.OnClientDisconnected += OnClientDisconnected;
+        beamSweepTimer = Core.Scheduler.DelayAndRepeatBySeconds(
+            BeamSweepIntervalSeconds,
+            BeamSweepIntervalSeconds,
+            () => Core.Scheduler.NextWorldUpdate(SweepExpiredBeams)
+        );
 
         if (shopApi is not null && !handlersRegistered)
         {
             RegisterItemsAndHandlers();
         }
-
-        if (hotReload)
-        {
-            foreach (var player in Core.PlayerManager.GetAllValidPlayers())
-            {
-                RefreshPlayerColor(player);
-            }
-        }
     }
 
     public override void Unload()
     {
-        Core.Event.OnTick -= OnTick;
         Core.Event.OnClientDisconnected -= OnClientDisconnected;
-
-        foreach (var player in Core.PlayerManager.GetAllValidPlayers())
-        {
-            ResetPlayerColor(player);
-        }
-
-        nextRainbowUpdateAtByPlayerId.Clear();
         previewRuntimeByPlayerId.Clear();
+        activeRuntimeByPlayerId.Clear();
+        nextDrawAllowedAtByPlayerId.Clear();
+
+        if (beamSweepTimer is not null)
+        {
+            beamSweepTimer.Cancel();
+            beamSweepTimer.Dispose();
+            beamSweepTimer = null;
+        }
+
+        DespawnAllBeams();
         UnregisterItemsAndHandlers();
-    }
-
-    [GameEventHandler(HookMode.Pre)]
-    public HookResult OnPlayerSpawn(EventPlayerSpawn e)
-    {
-        var player = Core.PlayerManager.GetPlayer(e.UserId);
-        if (player == null || !player.IsValid || player.IsFakeClient)
-        {
-            return HookResult.Continue;
-        }
-
-        RefreshPlayerColor(player);
-        return HookResult.Continue;
-    }
-
-    [GameEventHandler(HookMode.Pre)]
-    public HookResult OnPlayerDeath(EventPlayerDeath e)
-    {
-        var player = Core.PlayerManager.GetPlayer(e.UserId);
-        if (player == null || !player.IsValid || player.IsFakeClient)
-        {
-            return HookResult.Continue;
-        }
-
-        nextRainbowUpdateAtByPlayerId.Remove(player.PlayerID);
-        return HookResult.Continue;
     }
 
     private void OnClientDisconnected(IOnClientDisconnectedEvent e)
     {
-        nextRainbowUpdateAtByPlayerId.Remove(e.PlayerId);
         previewRuntimeByPlayerId.Remove(e.PlayerId);
-        cachedRuntimeByPlayerId.Remove(e.PlayerId);
+        activeRuntimeByPlayerId.Remove(e.PlayerId);
+        nextDrawAllowedAtByPlayerId.Remove(e.PlayerId);
+        DespawnPlayerPool(e.PlayerId);
     }
 
-    private void OnTick()
+    [GameEventHandler(HookMode.Pre)]
+    public HookResult OnBulletImpact(EventBulletImpact e)
     {
-        if (shopApi == null || !handlersRegistered || registeredItemOrder.Count == 0)
+        if (shopApi == null || !handlersRegistered) return HookResult.Continue;
+
+        var player = e.UserIdPlayer;
+        if (player == null || !player.IsValid || player.IsFakeClient) return HookResult.Continue;
+
+        if (!TryGetActiveRuntime(player, out var runtime)) return HookResult.Continue;
+
+        var now = Core.Engine.GlobalVars.CurrentTime;
+        if (nextDrawAllowedAtByPlayerId.TryGetValue(player.PlayerID, out var nextAllowedAt) && now < nextAllowedAt)
         {
-            return;
+            return HookResult.Continue;
         }
 
-        if (nextRainbowUpdateAtByPlayerId.Count == 0)
-        {
-            return;
-        }
+        if (!TryGetTracerStart(player, runtime.OriginZOffset, out var start)) return HookResult.Continue;
 
-        var currentTime = Core.Engine.GlobalVars.CurrentTime;
+        nextDrawAllowedAtByPlayerId[player.PlayerID] = now + Math.Max(runtimeSettings.MinDrawIntervalSeconds, 0.01f);
 
-        rainbowPlayersToRemove.Clear();
+        var end = new Vector(e.X, e.Y, e.Z);
+        var color = ResolveTracerColor(player, runtime);
 
-        foreach (var kvp in nextRainbowUpdateAtByPlayerId)
-        {
-            var playerId = kvp.Key;
-            var nextUpdateAt = kvp.Value;
-
-            if (currentTime < nextUpdateAt)
-            {
-                continue;
-            }
-
-            var player = Core.PlayerManager.GetPlayer(playerId);
-            if (!IsRealPlayer(player))
-            {
-                rainbowPlayersToRemove.Add(playerId);
-                continue;
-            }
-
-            if (!TryGetActiveRuntime(player, out var runtime))
-            {
-                rainbowPlayersToRemove.Add(playerId);
-                continue;
-            }
-
-            if (!runtime.IsRainbow)
-            {
-                rainbowPlayersToRemove.Add(playerId);
-                continue;
-            }
-
-            var rainbowColor = NextRainbowColor();
-            ApplyColor(player, rainbowColor);
-            nextRainbowUpdateAtByPlayerId[playerId] = currentTime + runtime.RainbowUpdateIntervalSeconds;
-        }
-
-        foreach (var playerId in rainbowPlayersToRemove)
-        {
-            nextRainbowUpdateAtByPlayerId.Remove(playerId);
-        }
+        var playerId = player.PlayerID;
+        Core.Scheduler.NextWorldUpdate(() => DrawTracer(playerId, start, end, color, runtime));
+        return HookResult.Continue;
     }
 
     private void RegisterItemsAndHandlers()
     {
-        if (shopApi == null)
-        {
-            return;
-        }
+        if (shopApi == null) return;
 
         UnregisterItemsAndHandlers();
 
-        var moduleConfig = shopApi.LoadModuleConfig<PlayerColorModuleConfig>(
-            ModulePluginId,
-            TemplateFileName,
-            TemplateSectionName
-        );
+        var moduleConfig = shopApi.LoadModuleConfig<TracersModuleConfig>(ModulePluginId, TemplateFileName, TemplateSectionName);
         NormalizeConfig(moduleConfig);
+
         runtimeSettings = moduleConfig.Settings;
 
-        var category = string.IsNullOrWhiteSpace(moduleConfig.Settings.Category)
-            ? DefaultCategory
-            : moduleConfig.Settings.Category.Trim();
+        var category = string.IsNullOrWhiteSpace(moduleConfig.Settings.Category) ? DefaultCategory : moduleConfig.Settings.Category.Trim();
 
         if (moduleConfig.Items.Count == 0)
         {
             moduleConfig = CreateDefaultConfig();
             category = moduleConfig.Settings.Category;
             runtimeSettings = moduleConfig.Settings;
-            _ = shopApi.SaveModuleConfig(
-                ModulePluginId,
-                moduleConfig,
-                TemplateFileName,
-                TemplateSectionName,
-                overwrite: true
-            );
+
+            _ = shopApi.SaveModuleConfig(ModulePluginId, moduleConfig, TemplateFileName, TemplateSectionName, overwrite: true);
         }
 
-        var registeredCount = 0;
         foreach (var itemTemplate in moduleConfig.Items)
         {
-            if (!TryCreateDefinition(itemTemplate, moduleConfig.Settings, category, out var definition, out var runtime))
-            {
-                continue;
-            }
+            if (!TryCreateDefinition(itemTemplate, moduleConfig.Settings, category, out var definition, out var runtime)) continue;
 
-            if (!shopApi.RegisterItem(definition))
-            {
-                Core.Logger.LogWarning("Failed to register player color item '{ItemId}'.", definition.Id);
-                continue;
-            }
+            if (!shopApi.RegisterItem(definition)) continue;
 
             _ = registeredItemIds.Add(definition.Id);
             registeredItemOrder.Add(definition.Id);
             itemRuntimeById[definition.Id] = runtime;
-            registeredCount++;
         }
 
         shopApi.OnBeforeItemPurchase += OnBeforeItemPurchase;
@@ -262,19 +275,11 @@ public class Shop_PlayerColor : BasePlugin
         shopApi.OnItemExpired += OnItemExpired;
         shopApi.OnItemPreview += OnItemPreview;
         handlersRegistered = true;
-
-        Core.Logger.LogInformation(
-            "Shop_PlayerColor initialized. RegisteredItems={RegisteredItems}",
-            registeredCount
-        );
     }
 
     private void UnregisterItemsAndHandlers()
     {
-        if (!handlersRegistered || shopApi == null)
-        {
-            return;
-        }
+        if (!handlersRegistered || shopApi == null) return;
 
         shopApi.OnBeforeItemPurchase -= OnBeforeItemPurchase;
         shopApi.OnItemToggled -= OnItemToggled;
@@ -282,40 +287,21 @@ public class Shop_PlayerColor : BasePlugin
         shopApi.OnItemExpired -= OnItemExpired;
         shopApi.OnItemPreview -= OnItemPreview;
 
-        foreach (var itemId in registeredItemIds)
-        {
-            _ = shopApi.UnregisterItem(itemId);
-        }
+        foreach (var itemId in registeredItemIds) { _ = shopApi.UnregisterItem(itemId); }
 
         registeredItemIds.Clear();
         registeredItemOrder.Clear();
         itemRuntimeById.Clear();
-        nextRainbowUpdateAtByPlayerId.Clear();
-        cachedRuntimeByPlayerId.Clear();
         handlersRegistered = false;
     }
 
     private void OnBeforeItemPurchase(ShopBeforePurchaseContext context)
     {
-        if (!registeredItemIds.Contains(context.Item.Id))
-        {
-            return;
-        }
+        if (!registeredItemIds.Contains(context.Item.Id) || !itemRuntimeById.TryGetValue(context.Item.Id, out var runtime)) return;
 
-        if (!itemRuntimeById.TryGetValue(context.Item.Id, out var runtime))
-        {
-            return;
-        }
+        if (string.IsNullOrWhiteSpace(runtime.RequiredPermission)) return;
 
-        if (string.IsNullOrWhiteSpace(runtime.RequiredPermission))
-        {
-            return;
-        }
-
-        if (Core.Permission.PlayerHasPermission(context.Player.SteamID, runtime.RequiredPermission))
-        {
-            return;
-        }
+        if (Core.Permission.PlayerHasPermission(context.Player.SteamID, runtime.RequiredPermission)) return;
 
         var player = context.Player;
         var loc = Core.Translation.GetPlayerLocalizer(player);
@@ -324,103 +310,72 @@ public class Shop_PlayerColor : BasePlugin
 
     private void OnItemToggled(IPlayer player, ShopItemDefinition item, bool enabled)
     {
-        if (shopApi == null || !registeredItemIds.Contains(item.Id))
+        activeRuntimeByPlayerId.Remove(player.PlayerID);
+
+        if (!enabled || shopApi == null || !registeredItemIds.Contains(item.Id))
         {
+            ReclaimPoolIfNoActiveTracer(player);
             return;
         }
 
-        if (enabled)
+        foreach (var otherItemId in registeredItemOrder)
         {
-            foreach (var otherItemId in registeredItemOrder)
-            {
-                if (string.Equals(otherItemId, item.Id, StringComparison.OrdinalIgnoreCase))
-                {
-                    continue;
-                }
+            if (string.Equals(otherItemId, item.Id, StringComparison.OrdinalIgnoreCase)) continue;
+            if (!shopApi.IsItemEnabled(player, otherItemId)) continue;
 
-                if (!shopApi.IsItemEnabled(player, otherItemId))
-                {
-                    continue;
-                }
-
-                _ = shopApi.SetItemEnabled(player, otherItemId, false);
-            }
+            _ = shopApi.SetItemEnabled(player, otherItemId, false);
         }
-
-        cachedRuntimeByPlayerId.Remove(player.PlayerID);
-        RefreshPlayerColor(player);
     }
 
     private void OnItemSold(IPlayer player, ShopItemDefinition item, decimal amount)
     {
-        if (!registeredItemIds.Contains(item.Id))
-        {
-            return;
-        }
-
-        cachedRuntimeByPlayerId.Remove(player.PlayerID);
-        RefreshPlayerColor(player);
+        activeRuntimeByPlayerId.Remove(player.PlayerID);
+        ReclaimPoolIfNoActiveTracer(player);
     }
 
     private void OnItemExpired(IPlayer player, ShopItemDefinition item)
     {
-        if (!registeredItemIds.Contains(item.Id))
-        {
-            return;
-        }
+        activeRuntimeByPlayerId.Remove(player.PlayerID);
+        ReclaimPoolIfNoActiveTracer(player);
+    }
 
-        cachedRuntimeByPlayerId.Remove(player.PlayerID);
-        RefreshPlayerColor(player);
+    private void ReclaimPoolIfNoActiveTracer(IPlayer player)
+    {
+        if (!beamPoolByPlayerId.ContainsKey(player.PlayerID)) return;
+        if (previewRuntimeByPlayerId.ContainsKey(player.PlayerID)) return;
+        if (TryGetEnabledRuntime(player, out _)) return;
+
+        DespawnPlayerPool(player.PlayerID);
     }
 
     private void OnItemPreview(IPlayer player, ShopItemDefinition item)
     {
-        if (!registeredItemIds.Contains(item.Id))
+        if (!registeredItemIds.Contains(item.Id) || !itemRuntimeById.TryGetValue(item.Id, out var runtime)) return;
+
+        previewRuntimeByPlayerId[player.PlayerID] = new TracerPreviewState(runtime, Core.Engine.GlobalVars.CurrentTime + PreviewDurationSeconds);
+
+        Core.Scheduler.NextWorldUpdate(() =>
         {
-            return;
-        }
+            if (!player.IsValid || player.IsFakeClient) return;
 
-        if (!itemRuntimeById.TryGetValue(item.Id, out var runtime))
-        {
-            return;
-        }
-
-        previewRuntimeByPlayerId[player.PlayerID] = new PlayerColorPreviewState(
-            Runtime: runtime,
-            ExpiresAt: Core.Engine.GlobalVars.CurrentTime + PreviewDurationSeconds
-        );
-
-        RefreshPlayerColor(player);
-        SendPreviewMessage(player, "preview.started", shopApi?.GetItemDisplayName(player, item) ?? item.DisplayName, (int)PreviewDurationSeconds);
+            var loc = Core.Translation.GetPlayerLocalizer(player);
+            player.SendChat($"{GetPrefix(player)} {loc["preview.started", shopApi?.GetItemDisplayName(player, item) ?? item.DisplayName, (int)PreviewDurationSeconds]}");
+        });
     }
 
-    private void RefreshPlayerColor(IPlayer player)
+    private string GetPrefix(IPlayer player)
     {
-        if (shopApi == null || player == null || !player.IsValid || player.IsFakeClient)
+        var loc = Core.Translation.GetPlayerLocalizer(player);
+        if (runtimeSettings.UseCorePrefix)
         {
-            return;
+            var corePrefix = shopApi?.GetShopPrefix(player);
+            if (!string.IsNullOrWhiteSpace(corePrefix)) return corePrefix;
         }
 
-        if (!TryGetActiveRuntime(player, out var runtime))
-        {
-            nextRainbowUpdateAtByPlayerId.Remove(player.PlayerID);
-            ResetPlayerColor(player);
-            return;
-        }
-
-        if (runtime.IsRainbow)
-        {
-            var color = NextRainbowColor();
-            ApplyColor(player, color);
-            nextRainbowUpdateAtByPlayerId[player.PlayerID] = Core.Engine.GlobalVars.CurrentTime + runtime.RainbowUpdateIntervalSeconds;
-            return;
-        }
-
-        nextRainbowUpdateAtByPlayerId.Remove(player.PlayerID);
-        ApplyColor(player, runtime.StaticColor);
+        return loc["shop.prefix"];
     }
 
-    private bool TryGetActiveRuntime(IPlayer player, out PlayerColorItemRuntime runtime)
+    private bool TryGetActiveRuntime(IPlayer player, out TracerItemRuntime runtime)
     {
         runtime = default;
 
@@ -438,229 +393,233 @@ public class Shop_PlayerColor : BasePlugin
         return TryGetEnabledRuntime(player, out runtime);
     }
 
-    private bool TryGetEnabledRuntime(IPlayer player, out PlayerColorItemRuntime runtime)
+    private bool TryGetEnabledRuntime(IPlayer player, out TracerItemRuntime runtime)
     {
         runtime = default;
 
-        if (shopApi == null)
+        if (shopApi == null) return false;
+
+        var now = Core.Engine.GlobalVars.CurrentTime;
+        if (activeRuntimeByPlayerId.TryGetValue(player.PlayerID, out var cached) && now < cached.NextRefreshAt)
         {
-            return false;
+            runtime = cached.Runtime;
+            return cached.HasRuntime;
         }
 
-        if (cachedRuntimeByPlayerId.TryGetValue(player.PlayerID, out var cached))
-        {
-            if (cached.HasValue)
-            {
-                runtime = cached.Value;
-                return true;
-            }
-            return false;
-        }
-
+        var found = false;
         foreach (var itemId in registeredItemOrder)
         {
-            if (!itemRuntimeById.TryGetValue(itemId, out var itemRuntime))
-            {
-                continue;
-            }
+            if (!itemRuntimeById.TryGetValue(itemId, out var itemRuntime)) continue;
 
-            if (!shopApi.IsItemEnabled(player, itemId))
-            {
-                continue;
-            }
+            if (!shopApi.IsItemEnabled(player, itemId)) continue;
 
             runtime = itemRuntime;
-            cachedRuntimeByPlayerId[player.PlayerID] = runtime;
-            return true;
+            found = true;
+            break;
         }
 
-        cachedRuntimeByPlayerId[player.PlayerID] = null;
-        return false;
+        activeRuntimeByPlayerId[player.PlayerID] = new CachedTracerRuntime(runtime, found, now + ActiveRuntimeRefreshSeconds);
+
+        return found;
     }
 
-    private void ApplyColor(IPlayer player, Color color)
+    private static bool TryGetTracerStart(IPlayer player, float zOffset, out Vector start)
     {
-        Core.Scheduler.NextWorldUpdate(() =>
-        {
-            if (!TryGetAlivePawn(player, out var pawn))
-            {
-                return;
-            }
+        start = Vector.Zero;
 
-            pawn.Render = color;
-            pawn.RenderUpdated();
-        });
+        var pawn = player.PlayerPawn;
+        if (pawn == null || !pawn.IsValid) return false;
+
+        var origin = pawn.AbsOrigin;
+        if (origin == null) return false;
+
+        start = new Vector(origin.Value.X, origin.Value.Y, origin.Value.Z + zOffset);
+        return true;
     }
 
-    private void ResetPlayerColor(IPlayer player)
+    private Color ResolveTracerColor(IPlayer player, TracerItemRuntime runtime)
     {
-        Core.Scheduler.NextWorldUpdate(() =>
+        return runtime.ColorMode switch
         {
-            if (!TryGetAlivePawn(player, out var pawn))
-            {
-                return;
-            }
-
-            pawn.Render = DefaultPlayerColor;
-            pawn.RenderUpdated();
-        });
+            TracerColorMode.Random => NextRandomColor(),
+            TracerColorMode.Team => ResolveTeamColor(player),
+            _ => runtime.StaticColor
+        };
     }
 
-    private void SendPreviewMessage(IPlayer player, string key, params object[] args)
+    private Color ResolveTeamColor(IPlayer player)
     {
-        Core.Scheduler.NextWorldUpdate(() =>
-        {
-            if (!player.IsValid || player.IsFakeClient)
-            {
-                return;
-            }
-
-            var loc = Core.Translation.GetPlayerLocalizer(player);
-            player.SendChat($"{GetPrefix(player)} {loc[key, args]}");
-        });
+        return player.Controller.TeamNum == (int)Team.CT ? TeamCtColor : TeamTColor;
     }
 
-    private string GetPrefix(IPlayer player)
-    {
-        var loc = Core.Translation.GetPlayerLocalizer(player);
-        if (runtimeSettings.UseCorePrefix)
-        {
-            var corePrefix = shopApi?.GetShopPrefix(player);
-            if (!string.IsNullOrWhiteSpace(corePrefix))
-            {
-                return corePrefix;
-            }
-        }
-
-        return loc["shop.prefix"];
-    }
-
-    private bool TryGetAlivePawn(IPlayer player, out CCSPlayerPawn pawn)
-    {
-        pawn = null!;
-
-        if (player == null || !player.IsValid)
-        {
-            return false;
-        }
-
-        var playerPawn = player.PlayerPawn;
-        if (playerPawn == null || !playerPawn.IsValid)
-        {
-            return false;
-        }
-
-        pawn = playerPawn;
-        return pawn.LifeState == (int)LifeState_t.LIFE_ALIVE;
-    }
-
-    private static bool IsRealPlayer([NotNullWhen(true)] IPlayer? player)
-    {
-        return player is not null && player.IsValid && !player.IsFakeClient;
-    }
-
-    private Color NextRainbowColor()
+    private Color NextRandomColor()
     {
         lock (random)
         {
-            return new Color(
-                random.Next(0, 256),
-                random.Next(0, 256),
-                random.Next(0, 256),
-                255
-            );
+            return new Color((byte)random.Next(0, 256), (byte)random.Next(0, 256), (byte)random.Next(0, 256), (byte)255);
+        }
+    }
+
+    private void DrawTracer(int playerId, Vector start, Vector end, Color color, TracerItemRuntime runtime)
+    {
+        try
+        {
+            var poolSize = Math.Max(runtimeSettings.PoolSizePerPlayer, 1);
+            if (!beamPoolByPlayerId.TryGetValue(playerId, out var pool))
+            {
+                pool = new TracerBeamPool(poolSize);
+                beamPoolByPlayerId[playerId] = pool;
+            }
+
+            var slotIndex = pool.NextIndex;
+            pool.NextIndex = (pool.NextIndex + 1) % pool.Slots.Length;
+
+            var beam = pool.Slots[slotIndex];
+            if (beam == null || !beam.IsValid)
+            {
+                beam = Core.EntitySystem.CreateEntityByDesignerName<CBeam>("beam");
+                if (beam == null || !beam.IsValid) return;
+
+                beam.Teleport(start, QAngle.Zero, Vector.Zero);
+                beam.DispatchSpawn();
+                pool.Slots[slotIndex] = beam;
+            }
+
+            beam.Teleport(start, QAngle.Zero, Vector.Zero);
+            
+            beam.EndPos.X = end.X;
+            beam.EndPos.Y = end.Y;
+            beam.EndPos.Z = end.Z;
+            beam.EndPosUpdated();
+
+            beam.Render = color;
+            beam.RenderUpdated();
+
+            beam.Width = runtime.StartWidth;
+            beam.WidthUpdated();
+
+            beam.EndWidth = runtime.EndWidth;
+            beam.EndWidthUpdated();
+
+            beam.TurnedOff = false;
+            beam.TurnedOffUpdated();
+
+            pool.HideAt[slotIndex] = Core.Engine.GlobalVars.CurrentTime + runtime.LifeSeconds;
+            pool.Hidden[slotIndex] = false;
+        }
+        catch (Exception ex)
+        {
+            Core.Logger.LogWarning(ex, "Failed to draw tracer beam.");
+        }
+    }
+
+    private void SweepExpiredBeams()
+    {
+        if (beamPoolByPlayerId.Count == 0) return;
+
+        var now = Core.Engine.GlobalVars.CurrentTime;
+
+        foreach (var pool in beamPoolByPlayerId.Values)
+        {
+            for (var i = 0; i < pool.Slots.Length; i++)
+            {
+                if (pool.Hidden[i]) continue;
+
+                var beam = pool.Slots[i];
+                if (beam == null || !beam.IsValid || now < pool.HideAt[i]) continue;
+
+                try
+                {
+                    beam.TurnedOff = true;
+                    beam.TurnedOffUpdated();
+                }
+                catch (Exception ex)
+                {
+                    Core.Logger.LogWarning(ex, "Failed to hide tracer beam entity.");
+                }
+
+                pool.Hidden[i] = true;
+            }
+        }
+    }
+
+    private void DespawnPlayerPool(int playerId)
+    {
+        if (!beamPoolByPlayerId.Remove(playerId, out var pool)) return;
+        DespawnPool(pool);
+    }
+
+    private void DespawnAllBeams()
+    {
+        foreach (var pool in beamPoolByPlayerId.Values) DespawnPool(pool);
+        beamPoolByPlayerId.Clear();
+    }
+
+    private void DespawnPool(TracerBeamPool pool)
+    {
+        foreach (var beam in pool.Slots)
+        {
+            if (beam == null) continue;
+            DespawnBeam(beam);
+        }
+    }
+
+    private void DespawnBeam(CBeam beam)
+    {
+        try
+        {
+            if (beam.IsValid) beam.Despawn();
+        }
+        catch (Exception ex)
+        {
+            Core.Logger.LogWarning(ex, "Failed to despawn tracer beam entity.");
         }
     }
 
     private bool TryCreateDefinition(
-        PlayerColorItemTemplate itemTemplate,
-        PlayerColorModuleSettings settings,
+        TracerItemTemplate itemTemplate,
+        TracersModuleSettings settings,
         string category,
         out ShopItemDefinition definition,
-        out PlayerColorItemRuntime runtime)
+        out TracerItemRuntime runtime)
     {
         definition = default!;
         runtime = default;
 
-        if (string.IsNullOrWhiteSpace(itemTemplate.Id))
-        {
-            return false;
-        }
+        if (string.IsNullOrWhiteSpace(itemTemplate.Id)) return false;
 
         var itemId = itemTemplate.Id.Trim();
-        if (itemTemplate.Price <= 0)
-        {
-            Core.Logger.LogWarning("Skipping item '{ItemId}' because Price must be greater than 0.", itemId);
-            return false;
-        }
 
-        if (!Enum.TryParse(itemTemplate.Type, ignoreCase: true, out ShopItemType itemType))
-        {
-            Core.Logger.LogWarning("Skipping item '{ItemId}' because Type '{Type}' is invalid.", itemId, itemTemplate.Type);
-            return false;
-        }
+        if (itemTemplate.Price <= 0) return false;
 
-        if (itemType == ShopItemType.Consumable)
-        {
-            Core.Logger.LogWarning(
-                "Skipping item '{ItemId}' because player color items cannot use Type '{Type}'.",
-                itemId,
-                itemType
-            );
-            return false;
-        }
+        if (!Enum.TryParse(itemTemplate.Type, ignoreCase: true, out ShopItemType itemType) || itemType == ShopItemType.Consumable) return false;
 
-        if (!Enum.TryParse(itemTemplate.Team, ignoreCase: true, out ShopItemTeam team))
-        {
-            team = ShopItemTeam.Any;
-        }
+        if (!Enum.TryParse(itemTemplate.Team, ignoreCase: true, out ShopItemTeam team)) team = ShopItemTeam.Any;
 
         TimeSpan? duration = null;
-        if (itemTemplate.DurationSeconds > 0)
-        {
-            duration = TimeSpan.FromSeconds(itemTemplate.DurationSeconds);
-        }
+        if (itemTemplate.DurationSeconds > 0) duration = TimeSpan.FromSeconds(itemTemplate.DurationSeconds);
 
-        if (itemType == ShopItemType.Temporary && !duration.HasValue)
-        {
-            Core.Logger.LogWarning(
-                "Skipping item '{ItemId}' because Temporary items require DurationSeconds > 0.",
-                itemId
-            );
-            return false;
-        }
+        if (itemType == ShopItemType.Temporary && !duration.HasValue) return false;
 
         decimal? sellPrice = null;
-        if (itemTemplate.SellPrice.HasValue && itemTemplate.SellPrice.Value >= 0)
-        {
-            sellPrice = itemTemplate.SellPrice.Value;
-        }
+        if (itemTemplate.SellPrice.HasValue && itemTemplate.SellPrice.Value >= 0) sellPrice = itemTemplate.SellPrice.Value;
 
-        var isRainbow = string.Equals(itemTemplate.Color?.Trim(), "rainbow", StringComparison.OrdinalIgnoreCase);
-        var staticColor = DefaultPlayerColor;
+        if (!TryResolveColorMode(itemTemplate.Color, out var colorMode, out var staticColor)) return false;
 
-        if (!isRainbow)
-        {
-            if (!TryResolveColor(itemTemplate.Color, out staticColor))
-            {
-                Core.Logger.LogWarning(
-                    "Skipping item '{ItemId}' because Color '{Color}' is invalid.",
-                    itemId,
-                    itemTemplate.Color
-                );
-                return false;
-            }
-        }
+        var lifeSeconds = itemTemplate.LifeSeconds ?? settings.DefaultLifeSeconds;
+        if (lifeSeconds <= 0f) lifeSeconds = 0.4f;
 
-        var rainbowInterval = itemTemplate.RainbowUpdateIntervalSeconds ?? settings.DefaultRainbowUpdateIntervalSeconds;
-        if (rainbowInterval < 0.05f)
-        {
-            rainbowInterval = 0.05f;
-        }
+        var startWidth = itemTemplate.StartWidth ?? settings.DefaultStartWidth;
+        if (startWidth <= 0f) startWidth = 2.0f;
+
+        var endWidth = itemTemplate.EndWidth ?? settings.DefaultEndWidth;
+        if (endWidth <= 0f) endWidth = 1.0f;
+
+        var originZOffset = itemTemplate.OriginZOffset ?? settings.DefaultOriginZOffset;
 
         definition = new ShopItemDefinition(
             Id: itemId,
-            DisplayName: ResolveDisplayName(itemTemplate, isRainbow),
+            DisplayName: ResolveDisplayName(itemTemplate),
             Category: category,
             Price: itemTemplate.Price,
             SellPrice: sellPrice,
@@ -669,200 +628,141 @@ public class Shop_PlayerColor : BasePlugin
             Team: team,
             Enabled: itemTemplate.Enabled,
             CanBeSold: itemTemplate.CanBeSold,
-            DisplayNameResolver: player => ResolveDisplayName(itemTemplate, isRainbow, player)
+            DisplayNameResolver: player => ResolveDisplayName(itemTemplate, player)
         );
 
-        runtime = new PlayerColorItemRuntime(
+        runtime = new TracerItemRuntime(
             ItemId: itemId,
-            IsRainbow: isRainbow,
+            ColorMode: colorMode,
             StaticColor: staticColor,
-            RainbowUpdateIntervalSeconds: rainbowInterval,
+            LifeSeconds: lifeSeconds,
+            StartWidth: startWidth,
+            EndWidth: endWidth,
+            OriginZOffset: originZOffset,
             RequiredPermission: itemTemplate.RequiredPermission?.Trim() ?? string.Empty
         );
 
         return true;
     }
 
-    private string ResolveDisplayName(PlayerColorItemTemplate itemTemplate, bool isRainbow, IPlayer? player = null)
+    private string ResolveDisplayName(TracerItemTemplate itemTemplate, IPlayer? player = null)
     {
+        var colorName = string.IsNullOrWhiteSpace(itemTemplate.ColorDisplayName) ? itemTemplate.Color : itemTemplate.ColorDisplayName;
+
         if (!string.IsNullOrWhiteSpace(itemTemplate.DisplayNameKey))
         {
             var key = itemTemplate.DisplayNameKey.Trim();
-            string localized;
             var localizer = player == null ? Core.Localizer : Core.Translation.GetPlayerLocalizer(player);
+            var localized = itemTemplate.Type.Equals(nameof(ShopItemType.Permanent), StringComparison.OrdinalIgnoreCase)
+                ? localizer[key, colorName]
+                : localizer[key, colorName, FormatDuration(itemTemplate.DurationSeconds)];
 
-            if (itemTemplate.Type.Equals(nameof(ShopItemType.Permanent), StringComparison.OrdinalIgnoreCase))
-            {
-                localized = localizer[key, itemTemplate.Color];
-            }
-            else
-            {
-                var duration = FormatDuration(itemTemplate.DurationSeconds);
-                localized = isRainbow
-                    ? localizer[key, duration]
-                    : localizer[key, itemTemplate.Color, duration];
-            }
-
-            if (!string.Equals(localized, key, StringComparison.Ordinal))
-            {
-                return localized;
-            }
+            if (!string.Equals(localized, key, StringComparison.Ordinal)) return localized;
         }
 
-        if (!string.IsNullOrWhiteSpace(itemTemplate.DisplayName))
-        {
-            return itemTemplate.DisplayName.Trim();
-        }
+        if (!string.IsNullOrWhiteSpace(itemTemplate.DisplayName)) return itemTemplate.DisplayName.Trim();
 
         return itemTemplate.Id.Trim();
     }
 
-    private static bool TryResolveColor(string? value, out Color color)
+    private static bool TryResolveColorMode(string? value, out TracerColorMode mode, out Color color)
     {
-        color = DefaultPlayerColor;
+        mode = TracerColorMode.Static;
+        color = new Color((byte)255, (byte)255, (byte)255, (byte)255);
 
-        if (string.IsNullOrWhiteSpace(value))
-        {
-            return false;
-        }
+        if (string.IsNullOrWhiteSpace(value)) return false;
 
         var text = value.Trim();
+        if (text.Equals("random", StringComparison.OrdinalIgnoreCase))
+        {
+            mode = TracerColorMode.Random;
+            return true;
+        }
+
+        if (text.Equals("team", StringComparison.OrdinalIgnoreCase))
+        {
+            mode = TracerColorMode.Team;
+            return true;
+        }
 
         if (text.StartsWith('#'))
         {
             try
             {
-                color = Color.FromHex(text);
+                var sysColor = ColorTranslator.FromHtml(text);
+                color = new Color(sysColor.R, sysColor.G, sysColor.B, sysColor.A);
                 return true;
             }
-            catch
-            {
-                return false;
-            }
+            catch { return false; }
         }
 
-        var builtin = System.Drawing.Color.FromName(text);
-        if (!builtin.IsKnownColor && !builtin.IsNamedColor && !builtin.IsSystemColor)
-        {
-            return false;
-        }
+        var builtin = SystemColor.FromName(text);
+        if (!builtin.IsKnownColor && !builtin.IsNamedColor && !builtin.IsSystemColor) return false;
 
-        color = Color.FromBuiltin(builtin);
+        color = new Color(builtin.R, builtin.G, builtin.B, builtin.A);
         return true;
     }
 
     private static string FormatDuration(int totalSeconds)
     {
-        if (totalSeconds <= 0)
-        {
-            return "0 Seconds";
-        }
+        if (totalSeconds <= 0) return "0 Seconds";
 
         var ts = TimeSpan.FromSeconds(totalSeconds);
         if (ts.TotalHours >= 1)
         {
             var hours = (int)ts.TotalHours;
             var minutes = ts.Minutes;
-            return minutes > 0
-                ? $"{hours} Hour{(hours == 1 ? "" : "s")} {minutes} Minute{(minutes == 1 ? "" : "s")}"
-                : $"{hours} Hour{(hours == 1 ? "" : "s")}";
+            return minutes > 0 ? $"{hours} Hour{(hours == 1 ? "" : "s")} {minutes} Minute{(minutes == 1 ? "" : "s")}" : $"{hours} Hour{(hours == 1 ? "" : "s")}";
         }
 
         if (ts.TotalMinutes >= 1)
         {
             var minutes = (int)ts.TotalMinutes;
             var seconds = ts.Seconds;
-            return seconds > 0
-                ? $"{minutes} Minute{(minutes == 1 ? "" : "s")} {seconds} Second{(seconds == 1 ? "" : "s")}"
-                : $"{minutes} Minute{(minutes == 1 ? "" : "s")}";
+            return seconds > 0 ? $"{minutes} Minute{(minutes == 1 ? "" : "s")} {seconds} Second{(seconds == 1 ? "" : "s")}" : $"{minutes} Minute{(minutes == 1 ? "" : "s")}";
         }
 
         return $"{ts.Seconds} Second{(ts.Seconds == 1 ? "" : "s")}";
     }
 
-    private static void NormalizeConfig(PlayerColorModuleConfig config)
+    private static void NormalizeConfig(TracersModuleConfig config)
     {
-        config.Settings ??= new PlayerColorModuleSettings();
+        config.Settings ??= new TracersModuleSettings();
         config.Items ??= [];
 
-        if (config.Settings.DefaultRainbowUpdateIntervalSeconds < 0.05f)
-        {
-            config.Settings.DefaultRainbowUpdateIntervalSeconds = 0.5f;
-        }
+        config.Settings.Category = string.IsNullOrWhiteSpace(config.Settings.Category) ? DefaultCategory : config.Settings.Category.Trim();
+
+        if (config.Settings.MinDrawIntervalSeconds <= 0f) config.Settings.MinDrawIntervalSeconds = 0.05f;
+        if (config.Settings.PoolSizePerPlayer <= 0) config.Settings.PoolSizePerPlayer = 8;
+        if (config.Settings.DefaultLifeSeconds <= 0f) config.Settings.DefaultLifeSeconds = 0.4f;
+        if (config.Settings.DefaultStartWidth <= 0f) config.Settings.DefaultStartWidth = 2.0f;
+        if (config.Settings.DefaultEndWidth <= 0f) config.Settings.DefaultEndWidth = 1.0f;
     }
 
-    private static PlayerColorModuleConfig CreateDefaultConfig()
+    private static TracersModuleConfig CreateDefaultConfig()
     {
-        return new PlayerColorModuleConfig
+        return new TracersModuleConfig
         {
-            Settings = new PlayerColorModuleSettings
+            Settings = new TracersModuleSettings
             {
                 Category = DefaultCategory,
-                DefaultRainbowUpdateIntervalSeconds = 0.5f
+                DefaultLifeSeconds = 0.4f,
+                DefaultStartWidth = 2.0f,
+                DefaultEndWidth = 1.0f,
+                DefaultOriginZOffset = 57f
             },
             Items =
             [
-                new PlayerColorItemTemplate
+                new TracerItemTemplate
                 {
-                    Id = "player_color_red_hourly",
-                    DisplayNameKey = "item.color.name",
+                    Id = "red_tracer_hourly",
                     Color = "Red",
-                    Price = 700,
-                    SellPrice = 350,
+                    ColorDisplayName = "Red",
+                    DisplayNameKey = "item.temporary.name",
+                    Price = 1250,
+                    SellPrice = 625,
                     DurationSeconds = 3600,
                     Type = nameof(ShopItemType.Temporary),
-                    Team = nameof(ShopItemTeam.Any),
-                    Enabled = true,
-                    CanBeSold = true
-                },
-                new PlayerColorItemTemplate
-                {
-                    Id = "player_color_blue_hourly",
-                    DisplayNameKey = "item.color.name",
-                    Color = "Blue",
-                    Price = 700,
-                    SellPrice = 350,
-                    DurationSeconds = 3600,
-                    Type = nameof(ShopItemType.Temporary),
-                    Team = nameof(ShopItemTeam.Any),
-                    Enabled = true,
-                    CanBeSold = true
-                },
-                new PlayerColorItemTemplate
-                {
-                    Id = "player_color_green_hourly",
-                    DisplayNameKey = "item.color.name",
-                    Color = "Green",
-                    Price = 700,
-                    SellPrice = 350,
-                    DurationSeconds = 3600,
-                    Type = nameof(ShopItemType.Temporary),
-                    Team = nameof(ShopItemTeam.Any),
-                    Enabled = true,
-                    CanBeSold = true
-                },
-                new PlayerColorItemTemplate
-                {
-                    Id = "player_color_rainbow_hourly",
-                    DisplayNameKey = "item.rainbow.name",
-                    Color = "Rainbow",
-                    Price = 1500,
-                    SellPrice = 750,
-                    DurationSeconds = 3600,
-                    Type = nameof(ShopItemType.Temporary),
-                    Team = nameof(ShopItemTeam.Any),
-                    Enabled = true,
-                    CanBeSold = true
-                },
-                new PlayerColorItemTemplate
-                {
-                    Id = "player_color_purple_permanent",
-                    DisplayNameKey = "item.permanent.name",
-                    Color = "Purple",
-                    Price = 8000,
-                    SellPrice = 4000,
-                    DurationSeconds = 0,
-                    Type = nameof(ShopItemType.Permanent),
                     Team = nameof(ShopItemTeam.Any),
                     Enabled = true,
                     CanBeSold = true
@@ -871,43 +771,3 @@ public class Shop_PlayerColor : BasePlugin
         };
     }
 }
-
-internal readonly record struct PlayerColorItemRuntime(
-    string ItemId,
-    bool IsRainbow,
-    Color StaticColor,
-    float RainbowUpdateIntervalSeconds,
-    string RequiredPermission
-);
-
-internal sealed class PlayerColorModuleConfig
-{
-    public PlayerColorModuleSettings Settings { get; set; } = new();
-    public List<PlayerColorItemTemplate> Items { get; set; } = [];
-}
-
-internal sealed class PlayerColorModuleSettings
-{
-    public bool UseCorePrefix { get; set; } = true;
-    public string Category { get; set; } = "Visuals/Player Colors";
-    public float DefaultRainbowUpdateIntervalSeconds { get; set; } = 0.5f;
-}
-
-internal sealed class PlayerColorItemTemplate
-{
-    public string Id { get; set; } = string.Empty;
-    public string DisplayName { get; set; } = string.Empty;
-    public string DisplayNameKey { get; set; } = string.Empty;
-    public int Price { get; set; } = 0;
-    public int? SellPrice { get; set; }
-    public int DurationSeconds { get; set; } = 0;
-    public string Type { get; set; } = nameof(ShopItemType.Temporary);
-    public string Team { get; set; } = nameof(ShopItemTeam.Any);
-    public bool Enabled { get; set; } = true;
-    public bool CanBeSold { get; set; } = true;
-    public string Color { get; set; } = "White";
-    public float? RainbowUpdateIntervalSeconds { get; set; }
-    public string RequiredPermission { get; set; } = string.Empty;
-}
-
-internal readonly record struct PlayerColorPreviewState(PlayerColorItemRuntime Runtime, float ExpiresAt);
