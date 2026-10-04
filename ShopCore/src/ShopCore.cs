@@ -153,7 +153,7 @@ public partial class ShopCore : BasePlugin
     internal string GetCentralModuleConfigsDirectoryPath()
     {
         return Path.Combine(
-            Core.CSGODirectory,
+            Core.GameFilesDirectory,
             "addons",
             "swiftlys2",
             "configs",
